@@ -1,5 +1,6 @@
 import argparse
 import time
+import glob
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,8 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import resnet
+
+from mpemu import mpt_emu
 
 model_names = sorted(name for name in resnet.__dict__
     if name.islower() and not name.startswith("__")
@@ -25,25 +28,14 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet20',
                     ' (default: resnet20)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--print-freq', '-p', default=50, type=int,
-                    metavar='N', help='print frequency (default: 50)')
-parser.add_argument('--resume', default='pytorch_resnet_cifar10/pretrained_models/resnet20-12fca82f.th', type=str, metavar='PATH',
-                    help='path to latest checkpoint (default: none)')
-parser.add_argument('--half', dest='half', action='store_true',
-                    help='use half-precision(16-bit) ')
+
 
 
 def main():
     global args
     args = parser.parse_args()
 
-    model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
-    model.cuda()
-
-    print("=> loading model '{}'".format(args.resume))
-    checkpoint = torch.load(args.resume)
-    model.load_state_dict(checkpoint['state_dict'])
-
+    # Setup stuff.
     cudnn.benchmark = True
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -57,17 +49,63 @@ def main():
         batch_size=128, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
-    # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-    if args.half:
-        model.half()
-        criterion.half()
+    test_archs = ['resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet110', 'resnet1202']
 
-    validate(val_loader, model, criterion)
+    frmts_torch_fp = ['fp32', 'fp16', 'bf16']
+
+    # Test a pretrained model for several formats.
+    print("----------------- Testing model " + args.arch)
+
+    pretrained_model = glob.glob('pretrained_models/' + args.arch + '-*')[0]
+
+    for frmt in ['int32']:  # Test fp formats from torch.
+
+        print("Testing format " + frmt)
+
+        model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
+        model.cuda()
+        model.load_state_dict(torch.load(pretrained_model)['state_dict'])
+
+        if(frmt == 'int32'):
+            model.qint32()
+            criterion.qint32()
+
+        validate(val_loader, model, criterion, frmt)
+
+    for frmt in frmts_torch_fp:  # Test fp formats from torch.
+
+        print("Testing format " + frmt)
+
+        model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
+        model.cuda()
+        model.load_state_dict(torch.load(pretrained_model)['state_dict'])
+
+        if(frmt == 'fp16'):
+            model.half()
+            criterion.half()
+        elif(frmt == 'bf16'):
+            model.bfloat16()
+            criterion.bfloat16()
+
+        validate(val_loader, model, criterion, frmt)
+
+    for frmt in ['e3m4', 'e4m3', 'e5m2']:  # Test fp8 formats.
+
+        print("Testing format " + frmt)
+
+        model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
+        model.cuda()
+        model.load_state_dict(torch.load(pretrained_model)['state_dict'])
+
+        model, emulator = mpt_emu.quantize_model(model, dtype=frmt)
+        model = emulator.fuse_bnlayers_and_quantize_model(model)
+
+        validate(val_loader, model, criterion)
 
 
-def validate(val_loader, model, criterion):
+def validate(val_loader, model, criterion, frmt=None):
     """
     Run evaluation
     """
@@ -85,8 +123,12 @@ def validate(val_loader, model, criterion):
             input_var = input.cuda()
             target_var = target.cuda()
 
-            if args.half:
+            if frmt == 'fp16':
                 input_var = input_var.half()
+            elif frmt == 'bf16':
+                input_var = input_var.bfloat16()
+            elif(frmt == 'int32'):
+                input_var = input_var.qint32()
 
             # compute output
             output = model(input_var)
@@ -103,14 +145,6 @@ def validate(val_loader, model, criterion):
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
-
-            if i % args.print_freq == 0:
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                          i, len(val_loader), batch_time=batch_time, loss=losses,
-                          top1=top1))
 
     print(' * Prec@1 {top1.avg:.3f}'
           .format(top1=top1))
